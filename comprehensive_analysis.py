@@ -159,17 +159,754 @@ def perform_cem_matching(df, covariates, treatment_col='treatment', n_bins=4):
     return df_matched
 
 
+# ==================== 分层分析功能 ====================
+# 扩展的正常范围（考虑临床意义）
+EXTENDED_NORMAL_RANGES = {
+    '白蛋白': {'lower': 40, 'upper': 55, 'unit': 'g/L', 'direction': 'higher_better'},
+    'ALT': {'lower': 7, 'upper': 40, 'unit': 'U/L', 'direction': 'lower_better'},
+    'AST': {'lower': 13, 'upper': 35, 'unit': 'U/L', 'direction': 'lower_better'},
+    'ALP': {'lower': 35, 'upper': 100, 'unit': 'U/L', 'direction': 'lower_better'},
+    'GGT': {'lower': 7, 'upper': 45, 'unit': 'U/L', 'direction': 'lower_better'},
+    '胆红素': {'lower': 3.4, 'upper': 17.1, 'unit': 'μmol/L', 'direction': 'lower_better'},
+    '肝硬度值': {'lower': 2.5, 'upper': 7.0, 'unit': 'kPa', 'direction': 'lower_better'},
+    '血小板': {'lower': 125, 'upper': 350, 'unit': '×10^9/L', 'direction': 'higher_better'},
+}
+
+
+def get_indicator_range(indicator_name):
+    """获取指标的正常范围信息"""
+    clean_name = indicator_name.replace('基线', '').replace('12个月', '').strip()
+    for key, value in EXTENDED_NORMAL_RANGES.items():
+        if key in clean_name:
+            return value
+    return None
+
+
+def classify_by_normal_range(baseline_val, endpoint_val, indicator_name):
+    """
+    根据正常范围对患者进行分类
+    
+    返回:
+        'both_normal': 基线和终点均在正常范围内 → 变化可能是正常生理波动
+        'both_abnormal': 基线和终点均异常 → 可能需更长治疗时间
+        'improved': 基线异常→终点正常 → 真正的治疗改善
+        'worsened': 基线正常→终点异常 → 恶化
+        'normal_improved': 基线正常且有改善趋势 → 在正常范围内优化
+    """
+    range_info = get_indicator_range(indicator_name)
+    if range_info is None:
+        return 'unknown'
+    
+    lower, upper = range_info['lower'], range_info['upper']
+    direction = range_info.get('direction', 'lower_better')
+    
+    baseline_normal = lower <= baseline_val <= upper
+    endpoint_normal = lower <= endpoint_val <= upper
+    
+    if baseline_normal and endpoint_normal:
+        return 'both_normal'
+    elif not baseline_normal and not endpoint_normal:
+        return 'both_abnormal'
+    elif not baseline_normal and endpoint_normal:
+        return 'improved'
+    else:  # baseline_normal and not endpoint_normal
+        return 'worsened'
+
+
+def analyze_normal_range_fluctuation(df, treatment_col='treatment', result_dir=None):
+    """
+    分析"正常范围内波动"情况
+    
+    临床意义：
+    - 基线和终点均在正常范围内的患者，其变化值可能只是正常生理波动
+    - 这类患者不应作为治疗效果评估的主要依据
+    - 真正的治疗效果应来自基线异常→终点正常的"复常"患者
+    """
+    if result_dir is None:
+        result_dir = RESULT_DIR
+        
+    print("\n" + "="*60)
+    print("额外分析: 正常范围内波动分析")
+    print("="*60)
+    print("说明: 区分正常波动与真正的治疗效果")
+    
+    indicators = [
+        ('基线ALT', 'ALT12个月', 'ALT'),
+        ('基线AST', 'AST12个月', 'AST'),
+        ('基线GGT', 'GGT12个月', 'GGT'),
+        ('基线ALP', 'ALP12个月', 'ALP'),
+        ('基线白蛋白', '白蛋白12个月', '白蛋白'),
+        ('基线胆红素', '总胆红素12个月', '胆红素'),
+    ]
+    
+    results = []
+    
+    for base_col, end_col, name in indicators:
+        if base_col not in df.columns or end_col not in df.columns:
+            continue
+            
+        for group_name, group_val in [('治疗组', 1), ('对照组', 0)]:
+            group = df[df[treatment_col] == group_val].copy()
+            valid = group[[base_col, end_col]].dropna()
+            
+            if len(valid) == 0:
+                continue
+            
+            # 分类每个患者
+            categories = valid.apply(
+                lambda row: classify_by_normal_range(row[base_col], row[end_col], name), 
+                axis=1
+            )
+            
+            total = len(categories)
+            both_normal = (categories == 'both_normal').sum()
+            both_abnormal = (categories == 'both_abnormal').sum()
+            improved = (categories == 'improved').sum()
+            worsened = (categories == 'worsened').sum()
+            
+            # 计算各类别的变化值
+            change = valid[end_col] - valid[base_col]
+            
+            results.append({
+                '指标': name,
+                '分组': group_name,
+                '总例数': total,
+                '双正常(可能为波动)': both_normal,
+                '双正常比例': f'{both_normal/total*100:.1f}%',
+                '基线异常→正常(复常)': improved,
+                '复常率': f'{improved/(both_abnormal+improved)*100:.1f}%' if (both_abnormal+improved) > 0 else 'N/A',
+                '基线正常→异常(恶化)': worsened,
+                '持续异常': both_abnormal,
+                '全组变化均值': change.mean(),
+                '双正常组变化均值': change[categories == 'both_normal'].mean() if both_normal > 0 else np.nan,
+                '注释': '双正常组变化可能是正常生理波动，不代表治疗效果'
+            })
+    
+    results_df = pd.DataFrame(results)
+    results_df.to_csv(f'{result_dir}/normal_range_fluctuation.csv', index=False, encoding='utf-8-sig')
+    
+    print("\n正常范围内波动分析:")
+    print(results_df[['指标', '分组', '双正常(可能为波动)', '双正常比例', '基线异常→正常(复常)']].to_string(index=False))
+    print("\n⚠️ 注意: '双正常'患者的变化值可能只是正常生理波动，需谨慎解读")
+    
+    return results_df
+
+
+def stratified_analysis(df, treatment_col='treatment', result_dir=None):
+    """
+    临床分层分析 - 区分基线正常和异常患者的治疗效果
+    
+    解决问题：
+    1. 天花板效应：基线正常者改善空间有限
+    2. 地板效应：基线已经处于最佳状态
+    3. 效应修饰：治疗效果可能因基线状态而异
+    """
+    if result_dir is None:
+        result_dir = RESULT_DIR
+        
+    print("\n" + "="*60)
+    print("8. 临床分层分析")
+    print("="*60)
+    print("说明: 按基线状态(正常/异常)分层，消除天花板/地板效应")
+    
+    # 分析的指标对
+    indicator_pairs = [
+        ('基线ALT', 'ALT12个月', 'ALT'),
+        ('基线AST', 'AST12个月', 'AST'),
+        ('基线GGT', 'GGT12个月', 'GGT'),
+        ('基线胆红素', '胆红素12个月', '胆红素'),
+        ('肝硬度值基线', '肝硬度值12个月', '肝硬度值'),
+    ]
+    
+    all_results = []
+    tolerance = 2  # 容忍度
+    
+    for base_col, end_col, name in indicator_pairs:
+        if base_col not in df.columns or end_col not in df.columns:
+            continue
+            
+        range_info = get_indicator_range(name)
+        if range_info is None:
+            continue
+            
+        upper = range_info['upper']
+        lower = range_info['lower']
+        direction = range_info['direction']
+        
+        # 有效数据
+        df_valid = df[[base_col, end_col, treatment_col]].dropna().copy()
+        if len(df_valid) < 10:
+            continue
+        
+        # 分类基线状态
+        def classify(x):
+            if x > upper + tolerance:
+                return '异常偏高'
+            elif x < lower - tolerance:
+                return '异常偏低'
+            else:
+                return '正常'
+        
+        df_valid['baseline_status'] = df_valid[base_col].apply(classify)
+        df_valid['change'] = df_valid[end_col] - df_valid[base_col]
+        
+        # 分层分析
+        for status in ['全人群', '基线异常偏高', '基线正常']:
+            if status == '全人群':
+                subgroup = df_valid
+            elif status == '基线异常偏高':
+                subgroup = df_valid[df_valid['baseline_status'] == '异常偏高']
+            else:
+                subgroup = df_valid[df_valid['baseline_status'] == '正常']
+            
+            if len(subgroup) < 5:
+                continue
+            
+            treated = subgroup[subgroup[treatment_col] == 1]
+            control = subgroup[subgroup[treatment_col] == 0]
+            
+            if len(treated) < 2 or len(control) < 2:
+                continue
+            
+            # t检验
+            try:
+                _, p_val = stats.ttest_ind(treated['change'], control['change'], equal_var=False)
+            except:
+                p_val = np.nan
+            
+            result = {
+                '指标': name,
+                '分层': status,
+                'N': len(subgroup),
+                '治疗组N': len(treated),
+                '对照组N': len(control),
+                '治疗组变化': treated['change'].mean(),
+                '对照组变化': control['change'].mean(),
+                '组间差异': treated['change'].mean() - control['change'].mean(),
+                'P值': p_val,
+                '显著': '是' if p_val < 0.05 else '否'
+            }
+            all_results.append(result)
+        
+        # 计算复常率（基线异常→终点正常）
+        abnormal_treated = df_valid[(df_valid['baseline_status'] == '异常偏高') & (df_valid[treatment_col] == 1)]
+        abnormal_control = df_valid[(df_valid['baseline_status'] == '异常偏高') & (df_valid[treatment_col] == 0)]
+        
+        if len(abnormal_treated) > 0:
+            normalized_t = len(abnormal_treated[abnormal_treated[end_col] <= upper + tolerance])
+            norm_rate_t = normalized_t / len(abnormal_treated) * 100
+        else:
+            norm_rate_t = np.nan
+            
+        if len(abnormal_control) > 0:
+            normalized_c = len(abnormal_control[abnormal_control[end_col] <= upper + tolerance])
+            norm_rate_c = normalized_c / len(abnormal_control) * 100
+        else:
+            norm_rate_c = np.nan
+        
+        # 计算维持率（基线正常→终点仍正常）
+        normal_treated = df_valid[(df_valid['baseline_status'] == '正常') & (df_valid[treatment_col] == 1)]
+        normal_control = df_valid[(df_valid['baseline_status'] == '正常') & (df_valid[treatment_col] == 0)]
+        
+        if len(normal_treated) > 0:
+            maintained_t = len(normal_treated[(normal_treated[end_col] >= lower - tolerance) & 
+                                               (normal_treated[end_col] <= upper + tolerance)])
+            maint_rate_t = maintained_t / len(normal_treated) * 100
+        else:
+            maint_rate_t = np.nan
+            
+        if len(normal_control) > 0:
+            maintained_c = len(normal_control[(normal_control[end_col] >= lower - tolerance) & 
+                                               (normal_control[end_col] <= upper + tolerance)])
+            maint_rate_c = maintained_c / len(normal_control) * 100
+        else:
+            maint_rate_c = np.nan
+        
+        # 添加复常率和维持率结果
+        all_results.append({
+            '指标': name,
+            '分层': '复常率',
+            'N': len(abnormal_treated) + len(abnormal_control),
+            '治疗组N': len(abnormal_treated),
+            '对照组N': len(abnormal_control),
+            '治疗组变化': norm_rate_t,
+            '对照组变化': norm_rate_c,
+            '组间差异': norm_rate_t - norm_rate_c if not np.isnan(norm_rate_t) and not np.isnan(norm_rate_c) else np.nan,
+            'P值': np.nan,
+            '显著': ''
+        })
+        
+        all_results.append({
+            '指标': name,
+            '分层': '维持率',
+            'N': len(normal_treated) + len(normal_control),
+            '治疗组N': len(normal_treated),
+            '对照组N': len(normal_control),
+            '治疗组变化': maint_rate_t,
+            '对照组变化': maint_rate_c,
+            '组间差异': maint_rate_t - maint_rate_c if not np.isnan(maint_rate_t) and not np.isnan(maint_rate_c) else np.nan,
+            'P值': np.nan,
+            '显著': ''
+        })
+    
+    results_df = pd.DataFrame(all_results)
+    results_df.to_csv(f'{result_dir}/stratified_analysis.csv', index=False, encoding='utf-8-sig')
+    
+    # 打印关键结果
+    print("\n分层分析结果摘要:")
+    print("-" * 80)
+    
+    for indicator in results_df['指标'].unique():
+        ind_df = results_df[results_df['指标'] == indicator]
+        print(f"\n【{indicator}】")
+        
+        # 全人群
+        full = ind_df[ind_df['分层'] == '全人群']
+        if len(full) > 0:
+            row = full.iloc[0]
+            p_str = f"P={row['P值']:.4f}" if not np.isnan(row['P值']) else ""
+            sig = " *" if row['显著'] == '是' else ""
+            print(f"  全人群(N={row['N']}): 治疗组{row['治疗组变化']:.2f} vs 对照组{row['对照组变化']:.2f} {p_str}{sig}")
+        
+        # 基线异常
+        abnormal = ind_df[ind_df['分层'] == '基线异常偏高']
+        if len(abnormal) > 0:
+            row = abnormal.iloc[0]
+            p_str = f"P={row['P值']:.4f}" if not np.isnan(row['P值']) else ""
+            sig = " *" if row['显著'] == '是' else ""
+            print(f"  基线异常(N={row['N']}): 治疗组{row['治疗组变化']:.2f} vs 对照组{row['对照组变化']:.2f} {p_str}{sig}")
+        
+        # 基线正常
+        normal = ind_df[ind_df['分层'] == '基线正常']
+        if len(normal) > 0:
+            row = normal.iloc[0]
+            p_str = f"P={row['P值']:.4f}" if not np.isnan(row['P值']) else ""
+            sig = " *" if row['显著'] == '是' else ""
+            print(f"  基线正常(N={row['N']}): 治疗组{row['治疗组变化']:.2f} vs 对照组{row['对照组变化']:.2f} {p_str}{sig}")
+        
+        # 复常率和维持率
+        norm = ind_df[ind_df['分层'] == '复常率']
+        maint = ind_df[ind_df['分层'] == '维持率']
+        if len(norm) > 0:
+            row = norm.iloc[0]
+            if not np.isnan(row['治疗组变化']) and not np.isnan(row['对照组变化']):
+                print(f"  复常率: 治疗组{row['治疗组变化']:.1f}% vs 对照组{row['对照组变化']:.1f}%")
+        if len(maint) > 0:
+            row = maint.iloc[0]
+            if not np.isnan(row['治疗组变化']) and not np.isnan(row['对照组变化']):
+                print(f"  维持率: 治疗组{row['治疗组变化']:.1f}% vs 对照组{row['对照组变化']:.1f}%")
+    
+    # 生成分层分析可视化
+    create_stratified_visualization(results_df, result_dir)
+    
+    return results_df
+
+
+def create_stratified_visualization(results_df, result_dir):
+    """创建分层分析可视化图"""
+    setup_lancet_style()
+    
+    # 筛选主要指标和主要分层
+    main_indicators = ['ALT', 'AST', '肝硬度值', '胆红素']
+    main_strata = ['全人群', '基线异常偏高', '基线正常']
+    
+    plot_df = results_df[
+        (results_df['指标'].isin(main_indicators)) & 
+        (results_df['分层'].isin(main_strata))
+    ].copy()
+    
+    if len(plot_df) == 0:
+        return
+    
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10), facecolor='white')
+    axes = axes.flatten()
+    
+    for idx, indicator in enumerate(main_indicators):
+        if idx >= 4:
+            break
+        ax = axes[idx]
+        ax.set_facecolor('white')
+        
+        ind_df = plot_df[plot_df['指标'] == indicator]
+        
+        x = np.arange(len(main_strata))
+        width = 0.35
+        
+        t_vals = []
+        c_vals = []
+        p_vals = []
+        
+        for stratum in main_strata:
+            row = ind_df[ind_df['分层'] == stratum]
+            if len(row) > 0:
+                t_vals.append(row.iloc[0]['治疗组变化'])
+                c_vals.append(row.iloc[0]['对照组变化'])
+                p_vals.append(row.iloc[0]['P值'])
+            else:
+                t_vals.append(0)
+                c_vals.append(0)
+                p_vals.append(np.nan)
+        
+        bars1 = ax.bar(x - width/2, t_vals, width, label='治疗组', color=TREATMENT_COLOR,
+                       edgecolor='white', linewidth=1)
+        bars2 = ax.bar(x + width/2, c_vals, width, label='对照组', color=CONTROL_COLOR,
+                       edgecolor='white', linewidth=1)
+        
+        ax.set_xticks(x)
+        ax.set_xticklabels(main_strata, fontsize=13, fontweight='bold')
+        ax.set_ylabel('变化值', fontsize=14, fontweight='bold')
+        ax.set_title(f'{indicator}分层分析', fontsize=16, fontweight='bold', pad=10)
+        ax.axhline(y=0, color='gray', linestyle='-', linewidth=0.8)
+        
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        
+        if idx == 0:
+            ax.legend(loc='upper right', frameon=False, fontsize=11)
+        
+        # 标注显著性
+        for i, p in enumerate(p_vals):
+            if not np.isnan(p) and p < 0.05:
+                max_y = max(abs(t_vals[i]), abs(c_vals[i]))
+                y_pos = max_y * 1.1 if max_y > 0 else max_y * 0.9
+                ax.text(i, y_pos, '*', ha='center', va='bottom', fontsize=16, fontweight='bold', color='red')
+    
+    plt.tight_layout()
+    save_lancet_figure(fig, f'{result_dir}/stratified_analysis.png')
+    print("\n分层分析图已保存: stratified_analysis.png")
+
+
+# ==================== 相关性分析 ====================
+def correlation_analysis(df, treatment_col='treatment', result_dir=None):
+    """
+    指标间相关性分析
+    根据正态性选择Pearson（正态）或Spearman（非正态）相关系数
+    """
+    if result_dir is None:
+        result_dir = RESULT_DIR
+        
+    print("\n" + "="*60)
+    print("9. 指标间相关性分析")
+    print("="*60)
+    print("方法选择: 正态分布→Pearson相关 | 非正态→Spearman相关")
+    
+    # 选择基线指标进行相关性分析
+    baseline_vars = ['基线ALT', '基线AST', '基线GGT', '基线ALP', '基线白蛋白', 
+                     '基线胆红素', '肝硬度值基线', '血小板基线']
+    baseline_vars = [v for v in baseline_vars if v in df.columns]
+    
+    # 变化值指标
+    change_pairs = [
+        ('基线ALT', 'ALT12个月', 'ALT变化'),
+        ('基线AST', 'AST12个月', 'AST变化'),
+        ('肝硬度值基线', '肝硬度值12个月', '肝硬度变化'),
+    ]
+    
+    # 计算变化值
+    df_corr = df.copy()
+    for base, end, change in change_pairs:
+        if base in df.columns and end in df.columns:
+            df_corr[change] = df_corr[end] - df_corr[base]
+    
+    all_vars = baseline_vars + [c[2] for c in change_pairs if c[2] in df_corr.columns]
+    
+    results = []
+    
+    # 计算相关系数矩阵
+    for i, var1 in enumerate(all_vars):
+        for j, var2 in enumerate(all_vars):
+            if i < j and var1 in df_corr.columns and var2 in df_corr.columns:
+                data1 = df_corr[var1].dropna()
+                data2 = df_corr[var2].dropna()
+                
+                # 取两个变量的共同索引
+                common_idx = data1.index.intersection(data2.index)
+                if len(common_idx) < 10:
+                    continue
+                    
+                x = df_corr.loc[common_idx, var1]
+                y = df_corr.loc[common_idx, var2]
+                
+                # 正态性检验
+                _, norm_p1 = stats.shapiro(x[:50]) if len(x) >= 3 else (0, 1)
+                _, norm_p2 = stats.shapiro(y[:50]) if len(y) >= 3 else (0, 1)
+                
+                is_normal = (norm_p1 >= 0.05) and (norm_p2 >= 0.05)
+                
+                if is_normal:
+                    # Pearson相关
+                    corr, pval = stats.pearsonr(x, y)
+                    method = 'Pearson'
+                    reason = '两变量均正态分布'
+                else:
+                    # Spearman相关
+                    corr, pval = stats.spearmanr(x, y)
+                    method = 'Spearman'
+                    reason = '存在非正态分布变量'
+                
+                # 相关强度判断
+                abs_corr = abs(corr)
+                if abs_corr >= 0.7:
+                    strength = '强相关'
+                elif abs_corr >= 0.4:
+                    strength = '中等相关'
+                elif abs_corr >= 0.2:
+                    strength = '弱相关'
+                else:
+                    strength = '极弱/无相关'
+                
+                results.append({
+                    '变量1': var1,
+                    '变量2': var2,
+                    'N': len(common_idx),
+                    '相关系数': corr,
+                    'P值': pval,
+                    '检验方法': method,
+                    '选择依据': reason,
+                    '相关强度': strength,
+                    '统计显著': '是' if pval < 0.05 else '否'
+                })
+    
+    results_df = pd.DataFrame(results)
+    results_df.to_csv(f'{result_dir}/correlation_analysis.csv', index=False, encoding='utf-8-sig')
+    
+    # 打印显著相关
+    print("\n显著相关（P<0.05）的变量对:")
+    print("-" * 70)
+    sig_results = results_df[results_df['统计显著'] == '是'].sort_values('相关系数', key=abs, ascending=False)
+    
+    for _, row in sig_results.head(10).iterrows():
+        print(f"  {row['变量1']} ↔ {row['变量2']}: r={row['相关系数']:.3f}, P={row['P值']:.4f} ({row['检验方法']}, {row['相关强度']})")
+    
+    # 创建相关系数热力图
+    create_correlation_heatmap(df_corr, baseline_vars, result_dir)
+    
+    return results_df
+
+
+def create_correlation_heatmap(df, variables, result_dir):
+    """创建相关系数热力图"""
+    setup_lancet_style()
+    
+    # 计算相关矩阵
+    corr_matrix = df[variables].corr(method='spearman')
+    
+    fig, ax = plt.subplots(figsize=(10, 8), facecolor='white')
+    ax.set_facecolor('white')
+    
+    # 绘制热力图
+    im = ax.imshow(corr_matrix, cmap='RdBu_r', vmin=-1, vmax=1, aspect='auto')
+    
+    # 添加颜色条
+    cbar = plt.colorbar(im, ax=ax, shrink=0.8)
+    cbar.set_label('相关系数', fontsize=14, fontweight='bold')
+    
+    # 设置刻度
+    ax.set_xticks(np.arange(len(variables)))
+    ax.set_yticks(np.arange(len(variables)))
+    
+    # 简化变量名
+    short_names = [v.replace('基线', '').replace('12个月', '') for v in variables]
+    ax.set_xticklabels(short_names, fontsize=12, fontweight='bold', rotation=45, ha='right')
+    ax.set_yticklabels(short_names, fontsize=12, fontweight='bold')
+    
+    # 添加数值标注
+    for i in range(len(variables)):
+        for j in range(len(variables)):
+            val = corr_matrix.iloc[i, j]
+            color = 'white' if abs(val) > 0.5 else 'black'
+            ax.text(j, i, f'{val:.2f}', ha='center', va='center', 
+                   fontsize=10, fontweight='bold', color=color)
+    
+    ax.set_title('基线指标相关性热力图（Spearman）', fontsize=16, fontweight='bold', pad=15)
+    
+    plt.tight_layout()
+    save_lancet_figure(fig, f'{result_dir}/correlation_heatmap.png')
+    print("\n相关性热力图已保存: correlation_heatmap.png")
+
+
+# ==================== 多因素回归分析 ====================
+def multivariate_regression_analysis(df, treatment_col='treatment', result_dir=None):
+    """
+    多因素回归分析 - 控制混杂因素后评估治疗效果
+    使用线性回归分析各结局指标
+    """
+    if result_dir is None:
+        result_dir = RESULT_DIR
+        
+    print("\n" + "="*60)
+    print("10. 多因素回归分析")
+    print("="*60)
+    print("目的: 控制混杂因素后评估治疗的独立效应")
+    
+    from sklearn.linear_model import LinearRegression
+    from sklearn.preprocessing import StandardScaler
+    
+    # 结局变量（变化值）
+    outcomes = [
+        ('基线ALT', 'ALT12个月', 'ALT变化'),
+        ('基线AST', 'AST12个月', 'AST变化'),
+        ('肝硬度值基线', '肝硬度值12个月', '肝硬度变化'),
+        ('基线胆红素', '胆红素12个月', '胆红素变化'),
+    ]
+    
+    # 协变量（混杂因素）
+    confounders = ['年龄', '性别', '是否合并脂肪肝']
+    confounders = [c for c in confounders if c in df.columns]
+    
+    all_results = []
+    
+    for base_col, end_col, outcome_name in outcomes:
+        if base_col not in df.columns or end_col not in df.columns:
+            continue
+        
+        # 创建分析数据
+        df_analysis = df.copy()
+        df_analysis['outcome'] = df_analysis[end_col] - df_analysis[base_col]
+        df_analysis['baseline'] = df_analysis[base_col]  # 基线值作为协变量
+        
+        # 准备特征
+        features = [treatment_col, 'baseline'] + confounders
+        
+        # 删除缺失值
+        df_valid = df_analysis[['outcome'] + features].dropna()
+        
+        if len(df_valid) < 30:
+            continue
+        
+        X = df_valid[features]
+        y = df_valid['outcome']
+        
+        # 拟合模型
+        model = LinearRegression()
+        model.fit(X, y)
+        
+        # 获取系数
+        coef_treatment = model.coef_[0]
+        
+        # 计算标准误和P值（使用statsmodels获得更详细的统计信息）
+        try:
+            import statsmodels.api as sm
+            X_with_const = sm.add_constant(X)
+            ols_model = sm.OLS(y, X_with_const).fit()
+            
+            # treatment系数在第2个位置（第1个是常数项）
+            treatment_idx = 1
+            coef = ols_model.params.iloc[treatment_idx]
+            se = ols_model.bse.iloc[treatment_idx]
+            pval = ols_model.pvalues.iloc[treatment_idx]
+            ci_low = ols_model.conf_int().iloc[treatment_idx, 0]
+            ci_high = ols_model.conf_int().iloc[treatment_idx, 1]
+            r_squared = ols_model.rsquared
+            
+            # 判断显著性
+            significant = pval < 0.05
+            
+            result = {
+                '结局变量': outcome_name,
+                'N': len(df_valid),
+                '治疗效应系数': coef,
+                '标准误': se,
+                '95%CI下限': ci_low,
+                '95%CI上限': ci_high,
+                'P值': pval,
+                'R²': r_squared,
+                '显著': '是' if significant else '否',
+                '控制变量': '基线值+' + '+'.join(confounders),
+                '解释': f"控制混杂因素后，治疗组{outcome_name}{'显著' if significant else '无显著'}{'减少' if coef < 0 else '增加'}{abs(coef):.2f}单位"
+            }
+            
+            all_results.append(result)
+            
+            print(f"\n【{outcome_name}】")
+            print(f"  样本量: {len(df_valid)}")
+            print(f"  治疗效应: β={coef:.3f}, SE={se:.3f}, P={pval:.4f}")
+            print(f"  95%CI: [{ci_low:.3f}, {ci_high:.3f}]")
+            print(f"  模型R²: {r_squared:.3f}")
+            print(f"  结论: {result['解释']}")
+            
+        except Exception as e:
+            print(f"  警告: {outcome_name}回归分析失败: {e}")
+    
+    results_df = pd.DataFrame(all_results)
+    results_df.to_csv(f'{result_dir}/multivariate_regression.csv', index=False, encoding='utf-8-sig')
+    
+    # 绘制森林图
+    if len(all_results) > 0:
+        create_regression_forest_plot(results_df, result_dir)
+    
+    return results_df
+
+
+def create_regression_forest_plot(results_df, result_dir):
+    """创建多因素回归森林图"""
+    setup_lancet_style()
+    
+    fig, ax = plt.subplots(figsize=(10, 6), facecolor='white')
+    ax.set_facecolor('white')
+    
+    outcomes = results_df['结局变量'].tolist()
+    y_pos = np.arange(len(outcomes))
+    
+    coefs = results_df['治疗效应系数'].values
+    ci_lows = results_df['95%CI下限'].values
+    ci_highs = results_df['95%CI上限'].values
+    pvals = results_df['P值'].values
+    
+    # 绘制误差线和点
+    colors = [TREATMENT_COLOR if p < 0.05 else '#888888' for p in pvals]
+    
+    for i, (y, coef, ci_l, ci_h, color) in enumerate(zip(y_pos, coefs, ci_lows, ci_highs, colors)):
+        ax.plot([ci_l, ci_h], [y, y], color=color, linewidth=2, solid_capstyle='round')
+        ax.scatter(coef, y, color=color, s=100, zorder=5, edgecolors='white', linewidth=1)
+    
+    # 添加零参考线
+    ax.axvline(x=0, color='black', linestyle='--', linewidth=1, alpha=0.7)
+    
+    # 设置轴
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(outcomes, fontsize=14, fontweight='bold')
+    ax.set_xlabel('治疗效应 (β系数)', fontsize=14, fontweight='bold')
+    ax.set_title('多因素回归分析：治疗对各指标变化的独立效应', fontsize=16, fontweight='bold', pad=15)
+    
+    # 添加P值标注
+    for i, (coef, p) in enumerate(zip(coefs, pvals)):
+        sig_mark = '*' if p < 0.05 else ''
+        ax.text(coef, i + 0.25, f'P={p:.3f}{sig_mark}', ha='center', fontsize=11, fontweight='bold')
+    
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    
+    # 添加图例说明
+    ax.text(0.02, 0.98, '红色: P<0.05 (显著)\n灰色: P≥0.05 (不显著)', 
+            transform=ax.transAxes, fontsize=11, va='top',
+            bbox=dict(boxstyle='round', facecolor='white', edgecolor='gray', alpha=0.8))
+    
+    plt.tight_layout()
+    save_lancet_figure(fig, f'{result_dir}/regression_forest_plot.png')
+    print("\n多因素回归森林图已保存: regression_forest_plot.png")
+
+
 # ==================== 1. 基线可比性检验 ====================
 def baseline_comparability_test(df, treatment_col='treatment', result_dir=None):
     """
     验证两组基线是否可比
-    使用t检验（连续变量）和卡方检验（分类变量）
+    检验选择依据：
+    - 连续变量：先Shapiro-Wilk正态性检验
+      - 两组均正态 → 独立样本t检验（Welch）
+      - 任一组非正态 → Mann-Whitney U检验
+    - 分类变量：
+      - 期望频数均≥5 → 卡方检验
+      - 存在期望频数<5 → Fisher精确检验
     """
     if result_dir is None:
         result_dir = RESULT_DIR
     print("\n" + "="*60)
     print("1. 基线可比性检验")
     print("="*60)
+    print("检验选择策略:")
+    print("  - 连续变量: Shapiro-Wilk正态性检验 → t检验/Mann-Whitney U")
+    print("  - 分类变量: 期望频数检验 → 卡方检验/Fisher精确检验")
     
     results = []
     treated = df[df[treatment_col] == 1]
@@ -188,13 +925,19 @@ def baseline_comparability_test(df, treatment_col='treatment', result_dir=None):
             c_data = control[var].dropna()
             
             if len(t_data) > 1 and len(c_data) > 1:
-                # t检验
+                # t检验（Welch，不假设方差齐性）
                 t_stat, t_pval = stats.ttest_ind(t_data, c_data, equal_var=False)
                 # Mann-Whitney U检验（非参数）
                 u_stat, u_pval = stats.mannwhitneyu(t_data, c_data, alternative='two-sided')
-                # 正态性检验
+                # 正态性检验 (Shapiro-Wilk)
                 _, norm_p_t = stats.shapiro(t_data[:50]) if len(t_data) >= 3 else (0, 1)
                 _, norm_p_c = stats.shapiro(c_data[:50]) if len(c_data) >= 3 else (0, 1)
+                
+                # 选择依据
+                is_normal = (norm_p_t >= 0.05) and (norm_p_c >= 0.05)
+                recommended_pval = t_pval if is_normal else u_pval
+                test_used = 't检验(Welch)' if is_normal else 'Mann-Whitney U'
+                selection_reason = '两组均正态分布' if is_normal else f'存在非正态(治疗组P={norm_p_t:.3f},对照组P={norm_p_c:.3f})'
                 
                 results.append({
                     '变量': var,
@@ -205,8 +948,10 @@ def baseline_comparability_test(df, treatment_col='treatment', result_dir=None):
                     '对照组SD': c_data.std(),
                     't检验P值': t_pval,
                     'Mann-Whitney P值': u_pval,
-                    '推荐P值': u_pval if (norm_p_t < 0.05 or norm_p_c < 0.05) else t_pval,
-                    '基线可比': '是' if (u_pval if (norm_p_t < 0.05 or norm_p_c < 0.05) else t_pval) > 0.05 else '否'
+                    '推荐P值': recommended_pval,
+                    '采用检验': test_used,
+                    '选择依据': selection_reason,
+                    '基线可比': '是' if recommended_pval > 0.05 else '否'
                 })
     
     # 分类变量 - 卡方检验
@@ -217,14 +962,21 @@ def baseline_comparability_test(df, treatment_col='treatment', result_dir=None):
                 chi2, chi_pval, dof, expected = stats.chi2_contingency(contingency)
                 
                 # Fisher精确检验（当期望频数<5时）
+                min_expected = expected.min()
                 if (expected < 5).any():
                     try:
                         _, fisher_pval = stats.fisher_exact(contingency)
                         final_pval = fisher_pval
+                        test_used = 'Fisher精确检验'
+                        selection_reason = f'存在期望频数<5(最小={min_expected:.1f})'
                     except:
                         final_pval = chi_pval
+                        test_used = '卡方检验'
+                        selection_reason = 'Fisher检验失败，使用卡方'
                 else:
                     final_pval = chi_pval
+                    test_used = '卡方检验'
+                    selection_reason = f'期望频数均≥5(最小={min_expected:.1f})'
                 
                 results.append({
                     '变量': var,
@@ -236,6 +988,8 @@ def baseline_comparability_test(df, treatment_col='treatment', result_dir=None):
                     't检验P值': np.nan,
                     'Mann-Whitney P值': np.nan,
                     '推荐P值': final_pval,
+                    '采用检验': test_used,
+                    '选择依据': selection_reason,
                     '基线可比': '是' if final_pval > 0.05 else '否'
                 })
     
@@ -255,6 +1009,9 @@ def baseline_comparability_test(df, treatment_col='treatment', result_dir=None):
 def liver_function_difference_analysis(df, treatment_col='treatment', result_dir=None):
     """
     比较治疗后肝功能指标的变化值差异
+    
+    新增功能：排除"双正常"患者（基线和终点均正常）后的敏感性分析
+    因为这类患者的变化可能只是正常生理波动，不代表真实治疗效果
     """
     if result_dir is None:
         result_dir = RESULT_DIR
@@ -279,21 +1036,40 @@ def liver_function_difference_analysis(df, treatment_col='treatment', result_dir
             treated = df[df[treatment_col] == 1]
             control = df[df[treatment_col] == 0]
             
-            # 计算变化值
+            # 计算变化值（全人群）
             t_valid = treated[[base_col, end_col]].dropna()
             c_valid = control[[base_col, end_col]].dropna()
             
             t_change = t_valid[end_col] - t_valid[base_col]
             c_change = c_valid[end_col] - c_valid[base_col]
             
+            # 分类：识别"双正常"患者
+            t_categories = t_valid.apply(
+                lambda row: classify_by_normal_range(row[base_col], row[end_col], name), 
+                axis=1
+            )
+            c_categories = c_valid.apply(
+                lambda row: classify_by_normal_range(row[base_col], row[end_col], name), 
+                axis=1
+            )
+            
+            # 排除双正常后的变化值（敏感性分析）
+            t_change_excl = t_change[t_categories != 'both_normal']
+            c_change_excl = c_change[c_categories != 'both_normal']
+            
             if len(t_change) > 1 and len(c_change) > 1:
-                # 独立样本t检验
+                # 全人群分析
                 t_stat, t_pval = stats.ttest_ind(t_change, c_change, equal_var=False)
-                # Mann-Whitney U检验
                 u_stat, u_pval = stats.mannwhitneyu(t_change, c_change, alternative='two-sided')
-                # 效应量Cohen's d
                 pooled_std = np.sqrt((t_change.var() + c_change.var()) / 2)
                 cohens_d = (t_change.mean() - c_change.mean()) / pooled_std if pooled_std > 0 else 0
+                
+                # 排除双正常后的敏感性分析
+                excl_pval = np.nan
+                excl_n_treated = len(t_change_excl)
+                excl_n_control = len(c_change_excl)
+                if len(t_change_excl) > 1 and len(c_change_excl) > 1:
+                    _, excl_pval = stats.mannwhitneyu(t_change_excl, c_change_excl, alternative='two-sided')
                 
                 # 判断方向
                 is_primary = name in ['ALT', 'AST']
@@ -313,7 +1089,12 @@ def liver_function_difference_analysis(df, treatment_col='treatment', result_dir
                     "Cohen's d": cohens_d,
                     '统计学差异': '是' if t_pval < 0.05 else '否',
                     '临床意义': '治疗组更优' if (name != '白蛋白' and t_change.mean() < c_change.mean()) or 
-                               (name == '白蛋白' and t_change.mean() > c_change.mean()) else '对照组更优或无差异'
+                               (name == '白蛋白' and t_change.mean() > c_change.mean()) else '对照组更优或无差异',
+                    # 敏感性分析（排除双正常）
+                    '排除双正常后_治疗组N': excl_n_treated,
+                    '排除双正常后_对照组N': excl_n_control,
+                    '排除双正常后_P值': excl_pval,
+                    '敏感性分析注释': f'排除{(t_categories=="both_normal").sum()}+{(c_categories=="both_normal").sum()}例双正常患者'
                 })
     
     results_df = pd.DataFrame(results)
@@ -321,6 +1102,8 @@ def liver_function_difference_analysis(df, treatment_col='treatment', result_dir
     
     print("\n肝功能变化值组间比较:")
     print(results_df[['指标', '治疗组变化均值', '对照组变化均值', '组间差异', 't检验P值', '统计学差异']].to_string(index=False))
+    print("\n敏感性分析（排除基线和终点均正常的患者）:")
+    print(results_df[['指标', '排除双正常后_治疗组N', '排除双正常后_对照组N', '排除双正常后_P值']].to_string(index=False))
     
     return results_df
 
@@ -659,9 +1442,26 @@ def barplot_comparison(df, treatment_col='treatment', result_dir=None):
             ax.set_title(f'{name}', fontsize=18, fontweight='bold', pad=10)
             ax.tick_params(axis='y', labelsize=14)
             
-            # 调整y轴范围避免图例重叠
-            ymin, ymax = ax.get_ylim()
-            ax.set_ylim(ymin * 0.95 if ymin > 0 else ymin, ymax * 1.25)
+            # 调整y轴范围 - 设置非零起始值以突显差异
+            all_values = [t_base_mean, t_end_mean, c_base_mean, c_end_mean]
+            all_se = [t_base_se, t_end_se, c_base_se, c_end_se]
+            
+            # 过滤掉NaN值
+            valid_values = [v for v in all_values if not np.isnan(v)]
+            valid_se = [s for s in all_se if not np.isnan(s)]
+            
+            if valid_values and valid_se:
+                min_val = min(valid_values) - max(valid_se) * 2
+                max_val = max(valid_values) + max(valid_se) * 3  # 留空间给数值标注
+                
+                # Y轴起始值设为最小值的60-80%，但不能为负（除非数据本身为负）
+                if min_val > 0:
+                    y_start = min_val * 0.7  # 从最小值的70%开始
+                else:
+                    y_start = min_val * 1.1
+                
+                ax.set_ylim(y_start, max_val * 1.15)
+            
             ax.legend(loc='upper right', fontsize=12, frameon=False)
             
             # Lancet风格：只保留左边和底部的边框
@@ -1182,8 +1982,11 @@ def run_comprehensive_analysis():
             # 1. 基线可比性检验
             results['baseline'] = baseline_comparability_test(df, result_dir=source_dir)
             
-            # 2. 治疗后肝功能差异
+            # 2. 治疗后肝功能差异（含正常范围内波动的敏感性分析）
             results['liver_function'] = liver_function_difference_analysis(df, result_dir=source_dir)
+            
+            # 2.5 正常范围内波动分析（区分正常生理波动与真正治疗效果）
+            results['normal_fluctuation'] = analyze_normal_range_fluctuation(df, result_dir=source_dir)
             
             # 3. 非劣效性检验
             results['non_inferiority'] = non_inferiority_test(df, result_dir=source_dir)
@@ -1200,6 +2003,15 @@ def run_comprehensive_analysis():
             # 7. 治愈速度分析
             results['cure_speed'], results['cure_comparison'] = cure_speed_analysis(df, result_dir=source_dir)
             
+            # 8. 临床分层分析（消除天花板/地板效应）
+            results['stratified'] = stratified_analysis(df, result_dir=source_dir)
+            
+            # 9. 相关性分析（Pearson/Spearman）
+            results['correlation'] = correlation_analysis(df, result_dir=source_dir)
+            
+            # 10. 多因素回归分析（控制混杂因素）
+            results['regression'] = multivariate_regression_analysis(df, result_dir=source_dir)
+            
         except Exception as e:
             print(f"警告: {source_name}分析部分失败: {e}")
             import traceback
@@ -1208,13 +2020,19 @@ def run_comprehensive_analysis():
         all_results[source_key] = results
     
     print("\n" + "="*70)
-    print("综合分析完成！")
+    print("综合分析完成！（共10项分析）")
     print("="*70)
     print(f"\n所有结果已保存至: {base_result_dir}/")
     print("\n结果目录结构:")
     print("  - Raw/    (原始数据分析)")
     print("  - PSM/    (PSM匹配后分析)")
     print("  - CEM/    (CEM匹配后分析)")
+    print("\n分析项目:")
+    print("  1. 基线可比性检验     6. 肝硬度值分析")
+    print("  2. 肝功能差异分析     7. 治愈速度分析")
+    print("  3. 非劣效性检验       8. 临床分层分析")
+    print("  4. 箱式图比较         9. 相关性分析")
+    print("  5. 柱状图比较        10. 多因素回归")
     
     # 生成汇总对比表
     generate_comparison_summary(all_results, data_sources, base_result_dir)
@@ -1267,6 +2085,32 @@ def generate_comparison_summary(all_results, data_sources, result_dir):
         cure_summary_df = pd.DataFrame(cure_summary)
         cure_summary_df.to_csv(f'{result_dir}/comparison_cure_rate.csv', 
                                index=False, encoding='utf-8-sig')
+    
+    # 汇总分层分析结果
+    stratified_summary = []
+    for source_key, (source_name, _) in data_sources.items():
+        if source_key in all_results and 'stratified' in all_results[source_key]:
+            strat_df = all_results[source_key]['stratified']
+            if strat_df is not None and len(strat_df) > 0:
+                # 只提取关键分层结果
+                key_strata = strat_df[strat_df['分层'].isin(['全人群', '基线异常偏高', '基线正常'])]
+                for _, row in key_strata.iterrows():
+                    stratified_summary.append({
+                        '数据来源': source_name,
+                        '指标': row.get('指标', ''),
+                        '分层': row.get('分层', ''),
+                        'N': row.get('N', 0),
+                        '治疗组变化': row.get('治疗组变化', np.nan),
+                        '对照组变化': row.get('对照组变化', np.nan),
+                        '组间差异': row.get('组间差异', np.nan),
+                        'P值': row.get('P值', np.nan),
+                        '显著': row.get('显著', '')
+                    })
+    
+    if stratified_summary:
+        stratified_summary_df = pd.DataFrame(stratified_summary)
+        stratified_summary_df.to_csv(f'{result_dir}/comparison_stratified.csv', 
+                                      index=False, encoding='utf-8-sig')
     
     print("对比汇总已保存")
 
