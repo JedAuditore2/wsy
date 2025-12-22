@@ -506,32 +506,65 @@ def create_stratified_visualization(results_df, result_dir):
     """创建分层分析可视化图"""
     setup_lancet_style()
     
-    # 筛选主要指标和主要分层
-    main_indicators = ['ALT', 'AST', '肝硬度值', '胆红素']
+    # 筛选主要分层
     main_strata = ['全人群', '基线异常偏高', '基线正常']
+    
+    # 动态获取实际存在的指标（优先选择主要指标）
+    preferred_indicators = ['ALT', 'AST', '肝硬度值', '胆红素', 'GGT']
+    available_indicators = results_df[results_df['分层'].isin(main_strata)]['指标'].unique().tolist()
+    
+    # 按优先级排序，选择前4个存在的指标
+    main_indicators = []
+    for ind in preferred_indicators:
+        if ind in available_indicators:
+            main_indicators.append(ind)
+        if len(main_indicators) == 4:
+            break
+    
+    # 如果不足4个，补充其他可用指标
+    if len(main_indicators) < 4:
+        for ind in available_indicators:
+            if ind not in main_indicators:
+                main_indicators.append(ind)
+            if len(main_indicators) == 4:
+                break
     
     plot_df = results_df[
         (results_df['指标'].isin(main_indicators)) & 
         (results_df['分层'].isin(main_strata))
     ].copy()
     
-    if len(plot_df) == 0:
+    if len(plot_df) == 0 or len(main_indicators) == 0:
         return
     
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10), facecolor='white')
-    axes = axes.flatten()
+    # 根据实际指标数量动态调整布局
+    n_indicators = len(main_indicators)
+    if n_indicators == 1:
+        fig, axes = plt.subplots(1, 1, figsize=(7, 5), facecolor='white')
+        axes = [axes]
+    elif n_indicators == 2:
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5), facecolor='white')
+        axes = axes.flatten()
+    elif n_indicators == 3:
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5), facecolor='white')
+        axes = axes.flatten()
+    else:  # 4个或更多
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10), facecolor='white')
+        axes = axes.flatten()
     
     for idx, indicator in enumerate(main_indicators):
-        if idx >= 4:
+        if idx >= len(axes):
             break
         ax = axes[idx]
         ax.set_facecolor('white')
         
         ind_df = plot_df[plot_df['指标'] == indicator]
         
-        x = np.arange(len(main_strata))
-        width = 0.35
+        if len(ind_df) == 0:
+            continue
         
+        # 只保留实际存在的分层
+        actual_strata = []
         t_vals = []
         c_vals = []
         p_vals = []
@@ -539,13 +572,16 @@ def create_stratified_visualization(results_df, result_dir):
         for stratum in main_strata:
             row = ind_df[ind_df['分层'] == stratum]
             if len(row) > 0:
+                actual_strata.append(stratum)
                 t_vals.append(row.iloc[0]['治疗组变化'])
                 c_vals.append(row.iloc[0]['对照组变化'])
                 p_vals.append(row.iloc[0]['P值'])
-            else:
-                t_vals.append(0)
-                c_vals.append(0)
-                p_vals.append(np.nan)
+        
+        if len(actual_strata) == 0:
+            continue
+        
+        x = np.arange(len(actual_strata))
+        width = 0.35
         
         bars1 = ax.bar(x - width/2, t_vals, width, label='治疗组', color=TREATMENT_COLOR,
                        edgecolor='white', linewidth=1)
@@ -553,7 +589,7 @@ def create_stratified_visualization(results_df, result_dir):
                        edgecolor='white', linewidth=1)
         
         ax.set_xticks(x)
-        ax.set_xticklabels(main_strata, fontsize=13, fontweight='bold')
+        ax.set_xticklabels(actual_strata, fontsize=13, fontweight='bold')
         ax.set_ylabel('变化值', fontsize=14, fontweight='bold')
         ax.set_title(f'{indicator}分层分析', fontsize=16, fontweight='bold', pad=10)
         ax.axhline(y=0, color='gray', linestyle='-', linewidth=0.8)
@@ -567,9 +603,23 @@ def create_stratified_visualization(results_df, result_dir):
         # 标注显著性
         for i, p in enumerate(p_vals):
             if not np.isnan(p) and p < 0.05:
-                max_y = max(abs(t_vals[i]), abs(c_vals[i]))
-                y_pos = max_y * 1.1 if max_y > 0 else max_y * 0.9
-                ax.text(i, y_pos, '*', ha='center', va='bottom', fontsize=16, fontweight='bold', color='red')
+                # 获取当前柱状图的最大/最小值
+                t_val = t_vals[i]
+                c_val = c_vals[i]
+                
+                # 根据数据正负确定星号位置
+                if t_val >= 0 or c_val >= 0:
+                    # 至少有一个正值，星号放在正值上方
+                    max_val = max(t_val, c_val)
+                    y_pos = max_val + abs(max_val) * 0.15 + 0.5
+                    va = 'bottom'
+                else:
+                    # 都是负值，星号放在负值下方
+                    min_val = min(t_val, c_val)
+                    y_pos = min_val - abs(min_val) * 0.15 - 0.5
+                    va = 'top'
+                
+                ax.text(i, y_pos, '*', ha='center', va=va, fontsize=16, fontweight='bold', color='red')
     
     plt.tight_layout()
     save_lancet_figure(fig, f'{result_dir}/stratified_analysis.png')
@@ -1010,29 +1060,42 @@ def liver_function_difference_analysis(df, treatment_col='treatment', result_dir
     """
     比较治疗后肝功能指标的变化值差异
     
-    新增功能：排除"双正常"患者（基线和终点均正常）后的敏感性分析
-    因为这类患者的变化可能只是正常生理波动，不代表真实治疗效果
+    分层分析策略：
+    1. 全人群分析
+    2. 基线异常患者分析 - 消除天花板效应
+    3. 基线正常患者分析 - 评估维持稳定能力
+    4. 排除"双正常"敏感性分析
     """
     if result_dir is None:
         result_dir = RESULT_DIR
     print("\n" + "="*60)
-    print("2. 治疗后肝功能差异分析")
+    print("2. 治疗后肝功能差异分析（含分层）")
     print("="*60)
+    print("分层策略: 全人群 / 基线异常 / 基线正常 / 排除双正常")
     
-    # 肝功能相关指标
+    # 肝功能相关指标及其正常上限
     liver_outcomes = [
-        ('基线ALT', 'ALT12个月', 'ALT'),
-        ('基线AST', 'AST12个月', 'AST'),
-        ('基线GGT', 'GGT12个月', 'GGT'),
-        ('基线ALP', 'ALP12个月', 'ALP'),
-        ('基线白蛋白', '白蛋白12个月', '白蛋白'),
-        ('基线胆红素', '总胆红素12个月', '胆红素'),
+        ('基线ALT', 'ALT12个月', 'ALT', 40),
+        ('基线AST', 'AST12个月', 'AST', 35),
+        ('基线GGT', 'GGT12个月', 'GGT', 45),
+        ('基线ALP', 'ALP12个月', 'ALP', 100),
+        ('基线白蛋白', '白蛋白12个月', '白蛋白', 55),  # 白蛋白是下限40
+        ('基线胆红素', '总胆红素12个月', '胆红素', 17.1),
     ]
     
     results = []
+    stratified_results = []
+    tolerance = 2  # 容忍度
     
-    for base_col, end_col, name in liver_outcomes:
+    for base_col, end_col, name, upper_limit in liver_outcomes:
         if base_col in df.columns and end_col in df.columns:
+            # 特殊处理白蛋白（下限异常）
+            if name == '白蛋白':
+                lower_limit = 40
+                is_abnormal_func = lambda x: x < lower_limit - tolerance
+            else:
+                is_abnormal_func = lambda x: x > upper_limit + tolerance
+            
             treated = df[df[treatment_col] == 1]
             control = df[df[treatment_col] == 0]
             
@@ -1053,7 +1116,18 @@ def liver_function_difference_analysis(df, treatment_col='treatment', result_dir
                 axis=1
             )
             
-            # 排除双正常后的变化值（敏感性分析）
+            # === 分层分析 ===
+            # 基线异常患者
+            t_abnormal_idx = t_valid[base_col].apply(is_abnormal_func)
+            c_abnormal_idx = c_valid[base_col].apply(is_abnormal_func)
+            t_change_abnormal = t_change[t_abnormal_idx]
+            c_change_abnormal = c_change[c_abnormal_idx]
+            
+            # 基线正常患者
+            t_change_normal = t_change[~t_abnormal_idx]
+            c_change_normal = c_change[~c_abnormal_idx]
+            
+            # 排除双正常后的变化值
             t_change_excl = t_change[t_categories != 'both_normal']
             c_change_excl = c_change[c_categories != 'both_normal']
             
@@ -1064,10 +1138,22 @@ def liver_function_difference_analysis(df, treatment_col='treatment', result_dir
                 pooled_std = np.sqrt((t_change.var() + c_change.var()) / 2)
                 cohens_d = (t_change.mean() - c_change.mean()) / pooled_std if pooled_std > 0 else 0
                 
+                # 基线异常亚组分析
+                abnormal_pval = np.nan
+                abnormal_diff = np.nan
+                if len(t_change_abnormal) > 1 and len(c_change_abnormal) > 1:
+                    _, abnormal_pval = stats.mannwhitneyu(t_change_abnormal, c_change_abnormal, alternative='two-sided')
+                    abnormal_diff = t_change_abnormal.mean() - c_change_abnormal.mean()
+                
+                # 基线正常亚组分析
+                normal_pval = np.nan
+                normal_diff = np.nan
+                if len(t_change_normal) > 1 and len(c_change_normal) > 1:
+                    _, normal_pval = stats.mannwhitneyu(t_change_normal, c_change_normal, alternative='two-sided')
+                    normal_diff = t_change_normal.mean() - c_change_normal.mean()
+                
                 # 排除双正常后的敏感性分析
                 excl_pval = np.nan
-                excl_n_treated = len(t_change_excl)
-                excl_n_control = len(c_change_excl)
                 if len(t_change_excl) > 1 and len(c_change_excl) > 1:
                     _, excl_pval = stats.mannwhitneyu(t_change_excl, c_change_excl, alternative='two-sided')
                 
@@ -1077,6 +1163,7 @@ def liver_function_difference_analysis(df, treatment_col='treatment', result_dir
                 results.append({
                     '指标': name,
                     '指标类型': '主要' if is_primary else '次要',
+                    '分层': '全人群',
                     '治疗组例数': len(t_change),
                     '治疗组变化均值': t_change.mean(),
                     '治疗组变化SD': t_change.std(),
@@ -1087,25 +1174,78 @@ def liver_function_difference_analysis(df, treatment_col='treatment', result_dir
                     't检验P值': t_pval,
                     'Mann-Whitney P值': u_pval,
                     "Cohen's d": cohens_d,
-                    '统计学差异': '是' if t_pval < 0.05 else '否',
+                    '统计学差异': '是' if u_pval < 0.05 else '否',
                     '临床意义': '治疗组更优' if (name != '白蛋白' and t_change.mean() < c_change.mean()) or 
                                (name == '白蛋白' and t_change.mean() > c_change.mean()) else '对照组更优或无差异',
-                    # 敏感性分析（排除双正常）
-                    '排除双正常后_治疗组N': excl_n_treated,
-                    '排除双正常后_对照组N': excl_n_control,
-                    '排除双正常后_P值': excl_pval,
-                    '敏感性分析注释': f'排除{(t_categories=="both_normal").sum()}+{(c_categories=="both_normal").sum()}例双正常患者'
+                })
+                
+                # 添加分层结果
+                # 基线异常
+                if len(t_change_abnormal) > 0 or len(c_change_abnormal) > 0:
+                    stratified_results.append({
+                        '指标': name,
+                        '分层': '基线异常',
+                        '治疗组N': len(t_change_abnormal),
+                        '治疗组变化': t_change_abnormal.mean() if len(t_change_abnormal) > 0 else np.nan,
+                        '对照组N': len(c_change_abnormal),
+                        '对照组变化': c_change_abnormal.mean() if len(c_change_abnormal) > 0 else np.nan,
+                        '组间差异': abnormal_diff,
+                        'P值': abnormal_pval,
+                        '显著': '是' if abnormal_pval < 0.05 else '否' if not np.isnan(abnormal_pval) else 'N/A',
+                        '注释': '消除天花板效应后的真实治疗效果'
+                    })
+                
+                # 基线正常
+                if len(t_change_normal) > 0 or len(c_change_normal) > 0:
+                    stratified_results.append({
+                        '指标': name,
+                        '分层': '基线正常',
+                        '治疗组N': len(t_change_normal),
+                        '治疗组变化': t_change_normal.mean() if len(t_change_normal) > 0 else np.nan,
+                        '对照组N': len(c_change_normal),
+                        '对照组变化': c_change_normal.mean() if len(c_change_normal) > 0 else np.nan,
+                        '组间差异': normal_diff,
+                        'P值': normal_pval,
+                        '显著': '是' if normal_pval < 0.05 else '否' if not np.isnan(normal_pval) else 'N/A',
+                        '注释': '评估在正常范围内的稳定维持能力'
+                    })
+                
+                # 排除双正常
+                stratified_results.append({
+                    '指标': name,
+                    '分层': '排除双正常',
+                    '治疗组N': len(t_change_excl),
+                    '治疗组变化': t_change_excl.mean() if len(t_change_excl) > 0 else np.nan,
+                    '对照组N': len(c_change_excl),
+                    '对照组变化': c_change_excl.mean() if len(c_change_excl) > 0 else np.nan,
+                    '组间差异': t_change_excl.mean() - c_change_excl.mean() if len(t_change_excl) > 0 and len(c_change_excl) > 0 else np.nan,
+                    'P值': excl_pval,
+                    '显著': '是' if excl_pval < 0.05 else '否' if not np.isnan(excl_pval) else 'N/A',
+                    '注释': f'排除{(t_categories=="both_normal").sum()}+{(c_categories=="both_normal").sum()}例双正常患者'
                 })
     
     results_df = pd.DataFrame(results)
+    stratified_df = pd.DataFrame(stratified_results)
+    
     results_df.to_csv(f'{result_dir}/liver_function_difference.csv', index=False, encoding='utf-8-sig')
+    stratified_df.to_csv(f'{result_dir}/liver_function_stratified.csv', index=False, encoding='utf-8-sig')
     
-    print("\n肝功能变化值组间比较:")
-    print(results_df[['指标', '治疗组变化均值', '对照组变化均值', '组间差异', 't检验P值', '统计学差异']].to_string(index=False))
-    print("\n敏感性分析（排除基线和终点均正常的患者）:")
-    print(results_df[['指标', '排除双正常后_治疗组N', '排除双正常后_对照组N', '排除双正常后_P值']].to_string(index=False))
+    print("\n全人群肝功能变化值组间比较:")
+    print(results_df[['指标', '治疗组变化均值', '对照组变化均值', '组间差异', 'Mann-Whitney P值', '统计学差异']].to_string(index=False))
     
-    return results_df
+    print("\n分层分析结果（基线异常 vs 基线正常）:")
+    print("-" * 80)
+    for indicator in stratified_df['指标'].unique():
+        ind_df = stratified_df[stratified_df['指标'] == indicator]
+        print(f"\n【{indicator}】")
+        for _, row in ind_df.iterrows():
+            p_str = f"P={row['P值']:.4f}" if not np.isnan(row['P值']) else "N/A"
+            sig = " *" if row['显著'] == '是' else ""
+            if not np.isnan(row['治疗组变化']) and not np.isnan(row['对照组变化']):
+                print(f"  {row['分层']}(治疗组N={row['治疗组N']}, 对照组N={row['对照组N']}): "
+                      f"治疗组{row['治疗组变化']:.2f} vs 对照组{row['对照组变化']:.2f} {p_str}{sig}")
+    
+    return results_df, stratified_df
 
 
 # ==================== 3. 非劣效性检验 ====================
@@ -1118,23 +1258,29 @@ def non_inferiority_test(df, treatment_col='treatment', margin=10, result_dir=No
     
     对于ALT/AST，下降越多越好，因此治疗组变化应该<=对照组变化
     margin: 非劣效界值（U/L），临床上通常取10 U/L或正常上限的25%
+    
+    分层分析：
+    1. 全人群分析
+    2. 基线异常患者分析 - 更能反映真实治疗效果
     """
     if result_dir is None:
         result_dir = RESULT_DIR
     print("\n" + "="*60)
-    print("3. 非劣效性检验")
+    print("3. 非劣效性检验（含分层）")
     print("="*60)
-    print(f"非劣效界值(margin): {margin} U/L")
+    print(f"非劣效界值(margin): ALT={margin} U/L, AST=8.75 U/L")
+    print("分层策略: 全人群 / 基线异常患者")
     
     # 主要针对ALT和AST
     ni_outcomes = [
-        ('基线ALT', 'ALT12个月', 'ALT', 10),  # margin = 10 U/L
-        ('基线AST', 'AST12个月', 'AST', 8.75),  # margin = 35*0.25 = 8.75 U/L
+        ('基线ALT', 'ALT12个月', 'ALT', 10, 40),  # margin = 10 U/L, upper_limit = 40
+        ('基线AST', 'AST12个月', 'AST', 8.75, 35),  # margin = 35*0.25 = 8.75 U/L, upper_limit = 35
     ]
     
     results = []
+    tolerance = 2  # 容忍度
     
-    for base_col, end_col, name, ni_margin in ni_outcomes:
+    for base_col, end_col, name, ni_margin, upper_limit in ni_outcomes:
         if base_col in df.columns and end_col in df.columns:
             treated = df[df[treatment_col] == 1]
             control = df[df[treatment_col] == 0]
@@ -1142,10 +1288,14 @@ def non_inferiority_test(df, treatment_col='treatment', margin=10, result_dir=No
             t_valid = treated[[base_col, end_col]].dropna()
             c_valid = control[[base_col, end_col]].dropna()
             
-            t_change = t_valid[end_col] - t_valid[base_col]
-            c_change = c_valid[end_col] - c_valid[base_col]
-            
-            if len(t_change) > 1 and len(c_change) > 1:
+            # === 分层分析函数 ===
+            def analyze_subgroup(t_data, c_data, subgroup_name):
+                t_change = t_data[end_col] - t_data[base_col]
+                c_change = c_data[end_col] - c_data[base_col]
+                
+                if len(t_change) < 2 or len(c_change) < 2:
+                    return None
+                
                 # 计算差异及其置信区间
                 diff = t_change.mean() - c_change.mean()
                 se_diff = np.sqrt(t_change.var()/len(t_change) + c_change.var()/len(c_change))
@@ -1154,16 +1304,16 @@ def non_inferiority_test(df, treatment_col='treatment', margin=10, result_dir=No
                 ci_lower = diff - 1.96 * se_diff
                 ci_upper = diff + 1.96 * se_diff
                 
-                # 非劣效性判断：CI上限 < margin (对于下降指标)
-                # 由于ALT/AST下降更好，如果治疗组变化更负（下降更多），差异为负
-                # 非劣效条件：差异的上限 < margin
+                # 非劣效性判断
                 is_non_inferior = ci_upper < ni_margin
-                
-                # 优效性判断：CI上限 < 0
                 is_superior = ci_upper < 0
                 
-                results.append({
+                return {
                     '指标': name,
+                    '分层': subgroup_name,
+                    'N': len(t_change) + len(c_change),
+                    '治疗组N': len(t_change),
+                    '对照组N': len(c_change),
                     '非劣效界值': ni_margin,
                     '治疗组变化均值': t_change.mean(),
                     '对照组变化均值': c_change.mean(),
@@ -1174,22 +1324,51 @@ def non_inferiority_test(df, treatment_col='treatment', margin=10, result_dir=No
                     '非劣效结论': '非劣效' if is_non_inferior else '未证明非劣效',
                     '优效结论': '优效' if is_superior else '未证明优效',
                     '综合结论': '优效' if is_superior else ('非劣效' if is_non_inferior else '结果不确定')
-                })
+                }
+            
+            # 全人群分析
+            full_result = analyze_subgroup(t_valid, c_valid, '全人群')
+            if full_result:
+                results.append(full_result)
+            
+            # 基线异常患者分析
+            t_abnormal = t_valid[t_valid[base_col] > upper_limit + tolerance]
+            c_abnormal = c_valid[c_valid[base_col] > upper_limit + tolerance]
+            abnormal_result = analyze_subgroup(t_abnormal, c_abnormal, '基线异常')
+            if abnormal_result:
+                results.append(abnormal_result)
+            
+            # 基线正常患者分析
+            t_normal = t_valid[t_valid[base_col] <= upper_limit + tolerance]
+            c_normal = c_valid[c_valid[base_col] <= upper_limit + tolerance]
+            normal_result = analyze_subgroup(t_normal, c_normal, '基线正常')
+            if normal_result:
+                results.append(normal_result)
     
     results_df = pd.DataFrame(results)
     results_df.to_csv(f'{result_dir}/non_inferiority_test.csv', index=False, encoding='utf-8-sig')
     
-    print("\n非劣效性检验结果:")
-    print(results_df[['指标', '差异(治疗-对照)', '95%CI下限', '95%CI上限', '非劣效界值', '综合结论']].to_string(index=False))
+    print("\n非劣效性检验结果（全人群 + 分层）:")
+    print("-" * 90)
+    for indicator in ['ALT', 'AST']:
+        ind_df = results_df[results_df['指标'] == indicator]
+        print(f"\n【{indicator}】")
+        for _, row in ind_df.iterrows():
+            print(f"  {row['分层']}(N={row['N']}): 差异={row['差异(治疗-对照)']:.2f}, "
+                  f"95%CI=[{row['95%CI下限']:.2f}, {row['95%CI上限']:.2f}], "
+                  f"界值={row['非劣效界值']:.1f} → {row['综合结论']}")
     
-    # 绘制非劣效性森林图 - 柳叶刀风格
+    # 绘制非劣效性森林图（只显示全人群结果）- 柳叶刀风格
+    full_results = results_df[results_df['分层'] == '全人群']
+    
     setup_lancet_style()
     fig, ax = plt.subplots(figsize=(10, 3.5), facecolor='white')
     ax.set_facecolor('white')
     
-    y_pos = np.arange(len(results_df))
+    y_pos = np.arange(len(full_results))
     
-    for i, row in results_df.iterrows():
+    for i, row in full_results.iterrows():
+        y_idx = list(full_results.index).index(i)
         # 柳叶刀配色：优效绿色，非劣效蓝色，未证明红色
         if row['综合结论'] == '优效':
             color = '#42B540'  # 绿色
@@ -1199,22 +1378,22 @@ def non_inferiority_test(df, treatment_col='treatment', margin=10, result_dir=No
             color = '#ED0000'  # 红色
         
         # 置信区间线
-        ax.plot([row['95%CI下限'], row['95%CI上限']], [i, i], 
+        ax.plot([row['95%CI下限'], row['95%CI上限']], [y_idx, y_idx], 
                color=color, linewidth=2.5, solid_capstyle='round')
         # 端点
-        ax.plot([row['95%CI下限'], row['95%CI上限']], [i, i], '|', 
+        ax.plot([row['95%CI下限'], row['95%CI上限']], [y_idx, y_idx], '|', 
                color=color, markersize=10, markeredgewidth=2)
         # 点估计 - 菱形
-        ax.plot(row['差异(治疗-对照)'], i, 'D', color=color, markersize=10, 
+        ax.plot(row['差异(治疗-对照)'], y_idx, 'D', color=color, markersize=10, 
                markeredgecolor='white', markeredgewidth=1)
     
     # 参考线
     ax.axvline(x=0, color='#333333', linestyle='-', linewidth=1.2, zorder=1)
-    ax.axvline(x=results_df['非劣效界值'].max(), color='#AD002A', linestyle='--', 
-              linewidth=1.5, label=f'非劣效界值 ({results_df["非劣效界值"].max():.1f})')
+    ax.axvline(x=full_results['非劣效界值'].max(), color='#AD002A', linestyle='--', 
+              linewidth=1.5, label=f'非劣效界值 ({full_results["非劣效界值"].max():.1f})')
     
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(results_df['指标'], fontsize=16)
+    ax.set_yticks(np.arange(len(full_results)))
+    ax.set_yticklabels(full_results['指标'], fontsize=16)
     ax.set_xlabel('变化值差异 (治疗组 - 对照组)', fontsize=16, fontweight='bold')
     ax.set_title('非劣效性检验森林图', fontsize=20, fontweight='bold', pad=15)
     
@@ -1374,6 +1553,141 @@ def boxplot_comparison(df, treatment_col='treatment', result_dir=None):
     save_lancet_figure(fig, f'{result_dir}/boxplot_change_comparison.png')
     
     print("变化值箱式图已保存: boxplot_change_comparison.png")
+    
+    # === 新增：分层变化值箱式图（基线异常 vs 基线正常）===
+    create_stratified_change_boxplot(df, treatment_col, result_dir)
+
+
+def create_stratified_change_boxplot(df, treatment_col='treatment', result_dir=None):
+    """
+    创建分层变化值箱式图 - 展示基线异常和基线正常患者的变化值差异
+    
+    目的：消除天花板效应，展示不同基线状态下的治疗效果
+    """
+    if result_dir is None:
+        result_dir = RESULT_DIR
+        
+    print("\n--- 分层变化值箱式图（基线异常 vs 基线正常）---")
+    
+    setup_lancet_style()
+    
+    # 需要分层分析的关键指标
+    indicators = [
+        ('基线ALT', 'ALT12个月', 'ALT', 40),
+        ('基线AST', 'AST12个月', 'AST', 35),
+        ('基线胆红素', '总胆红素12个月', '胆红素', 17.1),
+        ('肝硬度值基线', '肝硬度值12个月', '肝硬度', 7.0),
+    ]
+    
+    tolerance = 2  # 容忍度
+    
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10), facecolor='white')
+    axes = axes.flatten()
+    
+    for idx, (base_col, end_col, name, upper_limit) in enumerate(indicators):
+        if base_col not in df.columns or end_col not in df.columns:
+            continue
+            
+        ax = axes[idx]
+        ax.set_facecolor('white')
+        
+        # 肝硬度容忍度为0
+        tol = 0 if name == '肝硬度' else tolerance
+        
+        treated = df[df[treatment_col] == 1]
+        control = df[df[treatment_col] == 0]
+        
+        # 计算变化值
+        t_valid = treated[[base_col, end_col]].dropna()
+        c_valid = control[[base_col, end_col]].dropna()
+        
+        t_change = t_valid[end_col] - t_valid[base_col]
+        c_change = c_valid[end_col] - c_valid[base_col]
+        
+        # 分层：基线异常 vs 基线正常
+        t_abnormal_idx = t_valid[base_col] > upper_limit + tol
+        c_abnormal_idx = c_valid[base_col] > upper_limit + tol
+        
+        # 准备四组数据
+        data_groups = []
+        labels = []
+        colors_list = []
+        
+        # 基线异常-治疗组
+        t_change_abnormal = t_change[t_abnormal_idx]
+        if len(t_change_abnormal) >= 2:
+            data_groups.append(t_change_abnormal)
+            labels.append(f'基线异常\n治疗组(n={len(t_change_abnormal)})')
+            colors_list.append(TREATMENT_COLOR)
+        
+        # 基线异常-对照组
+        c_change_abnormal = c_change[c_abnormal_idx]
+        if len(c_change_abnormal) >= 2:
+            data_groups.append(c_change_abnormal)
+            labels.append(f'基线异常\n对照组(n={len(c_change_abnormal)})')
+            colors_list.append(CONTROL_COLOR)
+        
+        # 基线正常-治疗组
+        t_change_normal = t_change[~t_abnormal_idx]
+        if len(t_change_normal) >= 2:
+            data_groups.append(t_change_normal)
+            labels.append(f'基线正常\n治疗组(n={len(t_change_normal)})')
+            colors_list.append('#FF6B6B')  # 浅红
+        
+        # 基线正常-对照组
+        c_change_normal = c_change[~c_abnormal_idx]
+        if len(c_change_normal) >= 2:
+            data_groups.append(c_change_normal)
+            labels.append(f'基线正常\n对照组(n={len(c_change_normal)})')
+            colors_list.append('#6B9FFF')  # 浅蓝
+        
+        if len(data_groups) < 2:
+            ax.text(0.5, 0.5, '数据不足', ha='center', va='center', fontsize=14)
+            ax.set_title(f'{name}', fontsize=16, fontweight='bold')
+            continue
+        
+        # 绘制箱式图
+        bp = ax.boxplot(data_groups, patch_artist=True, labels=labels, widths=0.6,
+                       medianprops=dict(color='white', linewidth=2),
+                       whiskerprops=dict(color='#333333', linewidth=1),
+                       capprops=dict(color='#333333', linewidth=1),
+                       flierprops=dict(marker='o', markerfacecolor='#666666', 
+                                      markersize=4, alpha=0.5, markeredgecolor='none'))
+        
+        for patch, color in zip(bp['boxes'], colors_list):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.75)
+            patch.set_edgecolor('#333333')
+            patch.set_linewidth(1)
+        
+        # 添加散点
+        for i, (data, color) in enumerate(zip(data_groups, colors_list)):
+            x_jitter = np.random.normal(i + 1, 0.05, len(data))
+            ax.scatter(x_jitter, data, alpha=0.3, s=15, color=color, edgecolors='none', zorder=3)
+        
+        ax.axhline(y=0, color='#333333', linestyle='--', linewidth=1, alpha=0.7)
+        ax.set_title(f'{name}变化值分层比较', fontsize=16, fontweight='bold')
+        ax.set_ylabel('变化值', fontsize=14, fontweight='bold')
+        ax.tick_params(axis='both', labelsize=11)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        
+        # 添加P值标注（基线异常亚组）
+        if len(t_change_abnormal) >= 2 and len(c_change_abnormal) >= 2:
+            _, p_abnormal = stats.mannwhitneyu(t_change_abnormal, c_change_abnormal, alternative='two-sided')
+            sig = '*' if p_abnormal < 0.05 else ''
+            ax.text(0.5, 0.95, f'基线异常组间: P={p_abnormal:.3f}{sig}', 
+                   transform=ax.transAxes, ha='center', fontsize=12, 
+                   fontweight='bold' if p_abnormal < 0.05 else 'normal',
+                   color=TREATMENT_COLOR if p_abnormal < 0.05 else '#333333')
+    
+    plt.suptitle('分层变化值比较（消除天花板效应）\n深色=基线异常，浅色=基线正常', 
+                fontsize=18, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    save_lancet_figure(fig, f'{result_dir}/boxplot_stratified_change.png')
+    plt.close()
+    
+    print("分层变化值箱式图已保存: boxplot_stratified_change.png")
 
 
 # ==================== 5. 柱状图比较 ====================
@@ -1456,7 +1770,7 @@ def barplot_comparison(df, treatment_col='treatment', result_dir=None):
                 
                 # Y轴起始值设为最小值的60-80%，但不能为负（除非数据本身为负）
                 if min_val > 0:
-                    y_start = min_val * 0.7  # 从最小值的70%开始
+                    y_start = min_val * 0.7  # 从最小值的开始
                 else:
                     y_start = min_val * 1.1
                 
@@ -1550,21 +1864,145 @@ def barplot_comparison(df, treatment_col='treatment', result_dir=None):
     plt.close()
     
     print("变化值柱状图已保存: barplot_change_comparison.png")
+    
+    # === 新增：分层变化值柱状图（基线异常 vs 基线正常）===
+    create_stratified_change_barplot(df, treatment_col, result_dir)
+
+
+def create_stratified_change_barplot(df, treatment_col='treatment', result_dir=None):
+    """
+    创建分层变化值柱状图 - 展示基线异常患者的变化值比较
+    
+    目的：消除天花板效应，聚焦于基线异常患者的治疗效果
+    """
+    if result_dir is None:
+        result_dir = RESULT_DIR
+        
+    print("\n--- 分层变化值柱状图（基线异常亚组）---")
+    
+    setup_lancet_style()
+    
+    indicators = [
+        ('基线ALT', 'ALT12个月', 'ALT', 40, 2),
+        ('基线AST', 'AST12个月', 'AST', 35, 2),
+        ('基线GGT', 'GGT12个月', 'GGT', 45, 2),
+        ('基线ALP', 'ALP12个月', 'ALP', 100, 2),
+        ('基线白蛋白', '白蛋白12个月', '白蛋白', 38, 2),  # 低于正常视为异常
+        ('基线胆红素', '总胆红素12个月', '胆红素', 17.1, 2),
+    ]
+    
+    fig, axes = plt.subplots(2, 3, figsize=(16, 10), facecolor='white')
+    axes = axes.flatten()
+    
+    for idx, (base_col, end_col, name, threshold, tolerance) in enumerate(indicators):
+        if base_col not in df.columns or end_col not in df.columns:
+            continue
+            
+        ax = axes[idx]
+        ax.set_facecolor('white')
+        
+        treated = df[df[treatment_col] == 1]
+        control = df[df[treatment_col] == 0]
+        
+        # 分层：基线异常 vs 基线正常
+        # 白蛋白特殊：低于正常视为异常
+        if name == '白蛋白':
+            t_abnormal = treated[treated[base_col] < threshold - tolerance]
+            c_abnormal = control[control[base_col] < threshold - tolerance]
+            t_normal = treated[treated[base_col] >= threshold - tolerance]
+            c_normal = control[control[base_col] >= threshold - tolerance]
+        else:
+            t_abnormal = treated[treated[base_col] > threshold + tolerance]
+            c_abnormal = control[control[base_col] > threshold + tolerance]
+            t_normal = treated[treated[base_col] <= threshold + tolerance]
+            c_normal = control[control[base_col] <= threshold + tolerance]
+        
+        # 计算变化值
+        t_change_abn = (t_abnormal[end_col] - t_abnormal[base_col]).dropna()
+        c_change_abn = (c_abnormal[end_col] - c_abnormal[base_col]).dropna()
+        t_change_nor = (t_normal[end_col] - t_normal[base_col]).dropna()
+        c_change_nor = (c_normal[end_col] - c_normal[base_col]).dropna()
+        
+        # 准备数据 - 只包含有效数据
+        all_data = [
+            (t_change_abn, '基线异常\n治疗组', TREATMENT_COLOR),
+            (c_change_abn, '基线异常\n对照组', CONTROL_COLOR),
+            (t_change_nor, '基线正常\n治疗组', '#FF6B6B'),
+            (c_change_nor, '基线正常\n对照组', '#6B9FFF'),
+        ]
+        
+        # 过滤有效数据
+        valid_data = [(d, l, c) for d, l, c in all_data if len(d) >= 2]
+        
+        if len(valid_data) < 2:
+            ax.text(0.5, 0.5, '数据不足', ha='center', va='center', fontsize=14)
+            ax.set_title(f'{name}', fontsize=15, fontweight='bold')
+            continue
+        
+        means = [d.mean() for d, _, _ in valid_data]
+        ses = [d.std() / np.sqrt(len(d)) for d, _, _ in valid_data]
+        ns = [len(d) for d, _, _ in valid_data]
+        labels = [l for _, l, _ in valid_data]
+        colors = [c for _, _, c in valid_data]
+        
+        x = np.arange(len(valid_data))
+        bars = ax.bar(x, means, yerr=ses, capsize=4, color=colors,
+                     edgecolor='white', linewidth=1.2,
+                     error_kw={'elinewidth': 1.5, 'capthick': 1.5, 'ecolor': '#333333'})
+        
+        # 添加样本量标注
+        for i, (bar, n) in enumerate(zip(bars, ns)):
+            ax.text(bar.get_x() + bar.get_width()/2, 0.02, f'n={n}', 
+                   ha='center', va='bottom', fontsize=10, transform=ax.get_xaxis_transform())
+        
+        ax.axhline(y=0, color='#333333', linestyle='-', linewidth=1.2)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, fontsize=11)
+        ax.set_title(f'{name}变化值分层比较', fontsize=15, fontweight='bold')
+        ax.set_ylabel('变化值', fontsize=13, fontweight='bold')
+        ax.tick_params(axis='y', labelsize=12)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        
+        # 添加组间P值（基线异常亚组）
+        if len(t_change_abn) >= 2 and len(c_change_abn) >= 2:
+            _, p_val = stats.mannwhitneyu(t_change_abn, c_change_abn, alternative='two-sided')
+            sig = '*' if p_val < 0.05 else ''
+            ax.text(0.5, 0.97, f'基线异常组间P={p_val:.3f}{sig}', 
+                   transform=ax.transAxes, ha='center', fontsize=11,
+                   fontweight='bold' if p_val < 0.05 else 'normal',
+                   color=TREATMENT_COLOR if p_val < 0.05 else '#333333')
+    
+    plt.suptitle('分层变化值柱状图比较（消除天花板效应）\n深色=基线异常，浅色=基线正常', 
+                fontsize=18, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    save_lancet_figure(fig, f'{result_dir}/barplot_stratified_change.png')
+    plt.close()
+    
+    print("分层变化值柱状图已保存: barplot_stratified_change.png")
 
 
 # ==================== 6. 肝硬度值分析 ====================
 def liver_stiffness_analysis(df, treatment_col='treatment', result_dir=None):
     """
     分析肝硬度值治疗前后的组内和组间差异
+    
+    分层分析策略：
+    1. 全人群分析
+    2. 基线异常患者（肝硬度>7.0 kPa）分析 - 消除天花板效应
+    3. 基线正常患者（肝硬度≤7.0 kPa）分析 - 评估维持稳定能力
     """
     if result_dir is None:
         result_dir = RESULT_DIR
     print("\n" + "="*60)
-    print("6. 肝硬度值分析")
+    print("6. 肝硬度值分析（含分层）")
     print("="*60)
+    print("分层策略: 全人群 / 基线异常(>7.0kPa) / 基线正常(≤7.0kPa)")
     
     base_col = '肝硬度值基线'
     end_col = '肝硬度值12个月'
+    upper_limit = 7.0  # 肝硬度正常上限
+    tolerance = 0  # 肝硬度容忍度
     
     if base_col not in df.columns or end_col not in df.columns:
         print("警告: 未找到肝硬度值列")
@@ -1576,41 +2014,39 @@ def liver_stiffness_analysis(df, treatment_col='treatment', result_dir=None):
     t_valid = treated[[base_col, end_col]].dropna()
     c_valid = control[[base_col, end_col]].dropna()
     
-    results = {}
+    all_results = []
+    stratified_results = []
+    
+    # === 全人群分析 ===
+    print("\n--- 全人群分析 ---")
     
     # 组内比较（配对t检验）
-    print("\n--- 组内比较（治疗前后配对t检验）---")
-    
-    # 治疗组
     t_stat_t, p_t = stats.ttest_rel(t_valid[end_col], t_valid[base_col])
     _, wilcox_p_t = stats.wilcoxon(t_valid[end_col], t_valid[base_col])
     t_change = t_valid[end_col] - t_valid[base_col]
     
     print(f"治疗组: 基线={t_valid[base_col].mean():.2f}±{t_valid[base_col].std():.2f}, "
           f"12月={t_valid[end_col].mean():.2f}±{t_valid[end_col].std():.2f}")
-    print(f"  变化: {t_change.mean():.2f}±{t_change.std():.2f}, P={p_t:.4f} (配对t), P={wilcox_p_t:.4f} (Wilcoxon)")
+    print(f"  变化: {t_change.mean():.2f}±{t_change.std():.2f}, P={p_t:.4f} (配对t)")
     
-    # 对照组
     c_stat_t, p_c = stats.ttest_rel(c_valid[end_col], c_valid[base_col])
     _, wilcox_p_c = stats.wilcoxon(c_valid[end_col], c_valid[base_col])
     c_change = c_valid[end_col] - c_valid[base_col]
     
     print(f"对照组: 基线={c_valid[base_col].mean():.2f}±{c_valid[base_col].std():.2f}, "
           f"12月={c_valid[end_col].mean():.2f}±{c_valid[end_col].std():.2f}")
-    print(f"  变化: {c_change.mean():.2f}±{c_change.std():.2f}, P={p_c:.4f} (配对t), P={wilcox_p_c:.4f} (Wilcoxon)")
+    print(f"  变化: {c_change.mean():.2f}±{c_change.std():.2f}, P={p_c:.4f} (配对t)")
     
     # 组间比较
-    print("\n--- 组间比较（变化值独立样本检验）---")
     t_stat_between, p_between = stats.ttest_ind(t_change, c_change, equal_var=False)
     _, mw_p_between = stats.mannwhitneyu(t_change, c_change, alternative='two-sided')
     
-    print(f"治疗组变化 vs 对照组变化:")
-    print(f"  差异: {t_change.mean() - c_change.mean():.2f}")
-    print(f"  P={p_between:.4f} (独立t), P={mw_p_between:.4f} (Mann-Whitney)")
+    print(f"组间差异: {t_change.mean() - c_change.mean():.2f}, P={p_between:.4f} (t), P={mw_p_between:.4f} (MW)")
     
-    # 保存结果
-    results_df = pd.DataFrame([{
+    # 保存全人群结果
+    all_results.extend([{
         '分析类型': '治疗组组内',
+        '分层': '全人群',
         '基线均值': t_valid[base_col].mean(),
         '基线SD': t_valid[base_col].std(),
         '终点均值': t_valid[end_col].mean(),
@@ -1622,6 +2058,7 @@ def liver_stiffness_analysis(df, treatment_col='treatment', result_dir=None):
         '例数': len(t_valid)
     }, {
         '分析类型': '对照组组内',
+        '分层': '全人群',
         '基线均值': c_valid[base_col].mean(),
         '基线SD': c_valid[base_col].std(),
         '终点均值': c_valid[end_col].mean(),
@@ -1633,6 +2070,7 @@ def liver_stiffness_analysis(df, treatment_col='treatment', result_dir=None):
         '例数': len(c_valid)
     }, {
         '分析类型': '组间比较',
+        '分层': '全人群',
         '基线均值': np.nan,
         '基线SD': np.nan,
         '终点均值': np.nan,
@@ -1644,7 +2082,99 @@ def liver_stiffness_analysis(df, treatment_col='treatment', result_dir=None):
         '例数': len(t_valid) + len(c_valid)
     }])
     
+    stratified_results.append({
+        '分层': '全人群',
+        '治疗组N': len(t_valid),
+        '对照组N': len(c_valid),
+        '治疗组变化': t_change.mean(),
+        '治疗组SD': t_change.std(),
+        '对照组变化': c_change.mean(),
+        '对照组SD': c_change.std(),
+        '组间差异': t_change.mean() - c_change.mean(),
+        't检验P值': p_between,
+        'Mann-Whitney P值': mw_p_between,
+        '显著': '是' if mw_p_between < 0.05 else '否'
+    })
+    
+    # === 基线异常患者分析 ===
+    print("\n--- 基线异常患者(>7.0kPa)分析 ---")
+    
+    t_abnormal = t_valid[t_valid[base_col] > upper_limit + tolerance]
+    c_abnormal = c_valid[c_valid[base_col] > upper_limit + tolerance]
+    
+    if len(t_abnormal) >= 2 and len(c_abnormal) >= 2:
+        t_change_abnormal = t_abnormal[end_col] - t_abnormal[base_col]
+        c_change_abnormal = c_abnormal[end_col] - c_abnormal[base_col]
+        
+        _, p_abnormal = stats.ttest_ind(t_change_abnormal, c_change_abnormal, equal_var=False)
+        _, mw_p_abnormal = stats.mannwhitneyu(t_change_abnormal, c_change_abnormal, alternative='two-sided')
+        
+        print(f"治疗组(N={len(t_abnormal)}): 变化={t_change_abnormal.mean():.2f}±{t_change_abnormal.std():.2f}")
+        print(f"对照组(N={len(c_abnormal)}): 变化={c_change_abnormal.mean():.2f}±{c_change_abnormal.std():.2f}")
+        print(f"组间差异: {t_change_abnormal.mean() - c_change_abnormal.mean():.2f}, P={p_abnormal:.4f} (t), P={mw_p_abnormal:.4f} (MW)")
+        
+        stratified_results.append({
+            '分层': '基线异常(>7.0kPa)',
+            '治疗组N': len(t_abnormal),
+            '对照组N': len(c_abnormal),
+            '治疗组变化': t_change_abnormal.mean(),
+            '治疗组SD': t_change_abnormal.std(),
+            '对照组变化': c_change_abnormal.mean(),
+            '对照组SD': c_change_abnormal.std(),
+            '组间差异': t_change_abnormal.mean() - c_change_abnormal.mean(),
+            't检验P值': p_abnormal,
+            'Mann-Whitney P值': mw_p_abnormal,
+            '显著': '是' if mw_p_abnormal < 0.05 else '否'
+        })
+    else:
+        print(f"基线异常患者数量不足(治疗组{len(t_abnormal)}, 对照组{len(c_abnormal)})")
+    
+    # === 基线正常患者分析 ===
+    print("\n--- 基线正常患者(≤7.0kPa)分析 ---")
+    
+    t_normal = t_valid[t_valid[base_col] <= upper_limit + tolerance]
+    c_normal = c_valid[c_valid[base_col] <= upper_limit + tolerance]
+    
+    if len(t_normal) >= 2 and len(c_normal) >= 2:
+        t_change_normal = t_normal[end_col] - t_normal[base_col]
+        c_change_normal = c_normal[end_col] - c_normal[base_col]
+        
+        _, p_normal = stats.ttest_ind(t_change_normal, c_change_normal, equal_var=False)
+        _, mw_p_normal = stats.mannwhitneyu(t_change_normal, c_change_normal, alternative='two-sided')
+        
+        print(f"治疗组(N={len(t_normal)}): 变化={t_change_normal.mean():.2f}±{t_change_normal.std():.2f}")
+        print(f"对照组(N={len(c_normal)}): 变化={c_change_normal.mean():.2f}±{c_change_normal.std():.2f}")
+        print(f"组间差异: {t_change_normal.mean() - c_change_normal.mean():.2f}, P={p_normal:.4f} (t), P={mw_p_normal:.4f} (MW)")
+        
+        stratified_results.append({
+            '分层': '基线正常(≤7.0kPa)',
+            '治疗组N': len(t_normal),
+            '对照组N': len(c_normal),
+            '治疗组变化': t_change_normal.mean(),
+            '治疗组SD': t_change_normal.std(),
+            '对照组变化': c_change_normal.mean(),
+            '对照组SD': c_change_normal.std(),
+            '组间差异': t_change_normal.mean() - c_change_normal.mean(),
+            't检验P值': p_normal,
+            'Mann-Whitney P值': mw_p_normal,
+            '显著': '是' if mw_p_normal < 0.05 else '否'
+        })
+    else:
+        print(f"基线正常患者数量不足(治疗组{len(t_normal)}, 对照组{len(c_normal)})")
+    
+    # 保存结果
+    results_df = pd.DataFrame(all_results)
+    stratified_df = pd.DataFrame(stratified_results)
+    
     results_df.to_csv(f'{result_dir}/liver_stiffness_analysis.csv', index=False, encoding='utf-8-sig')
+    stratified_df.to_csv(f'{result_dir}/liver_stiffness_stratified.csv', index=False, encoding='utf-8-sig')
+    
+    # 打印分层汇总
+    print("\n=== 肝硬度值分层分析汇总 ===")
+    for _, row in stratified_df.iterrows():
+        sig = " *" if row['显著'] == '是' else ""
+        print(f"  {row['分层']}: 治疗组{row['治疗组变化']:.2f} vs 对照组{row['对照组变化']:.2f}, "
+              f"差异={row['组间差异']:.2f}, P={row['Mann-Whitney P值']:.4f}{sig}")
     
     # 绘图 - Lancet风格
     setup_lancet_style()
@@ -1982,13 +2512,13 @@ def run_comprehensive_analysis():
             # 1. 基线可比性检验
             results['baseline'] = baseline_comparability_test(df, result_dir=source_dir)
             
-            # 2. 治疗后肝功能差异（含正常范围内波动的敏感性分析）
-            results['liver_function'] = liver_function_difference_analysis(df, result_dir=source_dir)
+            # 2. 治疗后肝功能差异（含分层分析）
+            results['liver_function'], results['liver_function_stratified'] = liver_function_difference_analysis(df, result_dir=source_dir)
             
             # 2.5 正常范围内波动分析（区分正常生理波动与真正治疗效果）
             results['normal_fluctuation'] = analyze_normal_range_fluctuation(df, result_dir=source_dir)
             
-            # 3. 非劣效性检验
+            # 3. 非劣效性检验（含分层）
             results['non_inferiority'] = non_inferiority_test(df, result_dir=source_dir)
             
             # 4. 箱式图比较
@@ -1997,7 +2527,7 @@ def run_comprehensive_analysis():
             # 5. 柱状图比较
             barplot_comparison(df, result_dir=source_dir)
             
-            # 6. 肝硬度值分析
+            # 6. 肝硬度值分析（含分层）
             results['liver_stiffness'] = liver_stiffness_analysis(df, result_dir=source_dir)
             
             # 7. 治愈速度分析
